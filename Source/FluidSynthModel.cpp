@@ -4,17 +4,18 @@
 
 #include <iostream>
 #include <iterator>
+#include <vector>
 #include <fluidsynth.h>
 #include "FluidSynthModel.h"
 #include "MidiConstants.h"
 #include "Util.h"
 
 #if JUCE_MAC || JUCE_IOS
-  #include <juce_core/native/juce_mac_CFHelpers.h>
   #include <CoreFoundation/CFString.h>
   #include <CoreFoundation/CFData.h>
   #include <CoreFoundation/CFURL.h>
   #include <CoreFoundation/CFError.h>
+  #include <juce_core/native/juce_CFHelpers_mac.h>
   using juce::CFUniquePtr;
 #endif
 
@@ -72,16 +73,22 @@ void FluidSynthModel::initialise() {
     // after all: we only use fluidsynth to render blocks of audio. it doesn't output to audio driver.
     const char *DRV[] {NULL};
     fluid_audio_driver_register(DRV);
-    
+
     settings = { new_fluid_settings(), delete_fluid_settings };
-    
+
     // https://sourceforge.net/p/fluidsynth/wiki/FluidSettings/
 #if JUCE_DEBUG
     fluid_settings_setint(settings.get(), "synth.verbose", 1);
 #endif
 
+    setUpSynth();
+}
+
+void FluidSynthModel::setUpSynth() {
+    // fluid_synth_set_sample_rate() no longer has any effect once the synth has been created
+    // (removed in fluidsynth >= 2.3), so the sample rate must be set via settings beforehand.
+    fluid_settings_setnum(settings.get(), "synth.sample-rate", currentSampleRate);
     synth = { new_fluid_synth(settings.get()), delete_fluid_synth };
-    fluid_synth_set_sample_rate(synth.get(), currentSampleRate);
 
     // I can't hear a damned thing
     fluid_synth_set_gain(synth.get(), 2.0);
@@ -223,7 +230,7 @@ void FluidSynthModel::valueTreePropertyChanged(ValueTree& treeWhosePropertyHasCh
     if (treeWhosePropertyHasChanged.getType() == StringRef("soundFont")) {
 #if JUCE_MAC || JUCE_IOS
         if (property == StringRef("bookmark")) {
-            CFErrorRef* cfError;
+            CFErrorRef cfErrorRaw{nullptr};
             MemoryBlock buffer;
             var bookmark = treeWhosePropertyHasChanged.getProperty("bookmark", buffer);
             jassert(bookmark.isBinaryData());
@@ -231,14 +238,43 @@ void FluidSynthModel::valueTreePropertyChanged(ValueTree& treeWhosePropertyHasCh
                 NULL,
                 static_cast<const UInt8 *>(bookmark.getBinaryData()->getData()),
                 static_cast<CFIndex>(bookmark.getBinaryData()->getSize()))};
-            CFUniquePtr<CFURLRef> cfURL{CFURLCreateByResolvingBookmarkData(NULL, data.get(), kCFURLBookmarkResolutionWithSecurityScope, NULL, NULL, NULL, cfError)};
+            CFUniquePtr<CFURLRef> cfURL{CFURLCreateByResolvingBookmarkData(NULL, data.get(), kCFURLBookmarkResolutionWithSecurityScope, NULL, NULL, NULL, &cfErrorRaw)};
+            CFUniquePtr<CFErrorRef> cfError{cfErrorRaw};
+
+            if (cfURL == nullptr) {
+#if JUCE_DEBUG
+                if (cfError != nullptr) {
+                    CFUniquePtr<CFStringRef> cfErrorDescription{CFErrorCopyDescription(cfError.get())};
+                    Logger::outputDebugString("Failed to resolve security-scoped bookmark: " + String::fromCFString(cfErrorDescription.get()));
+                }
+#endif
+                return;
+            }
 
             CFUniquePtr<CFStringRef> cfPath {CFURLCopyFileSystemPath(cfURL.get(), CFURLPathStyle::kCFURLPOSIXPathStyle)};
-            StringRef path {String::fromCFString(cfPath.get())};
+            // must be a String (which owns its buffer), not a StringRef (which would dangle):
+            // String::fromCFString() returns a temporary, and StringRef only borrows a pointer
+            // into it, so it would go stale the moment that temporary is destroyed.
+            String path {String::fromCFString(cfPath.get())};
             if (path.isNotEmpty()) {
                 CFURLStartAccessingSecurityScopedResource(cfURL.get());
                 unloadAndLoadFont(path);
                 CFURLStopAccessingSecurityScopedResource(cfURL.get());
+            }
+        } else if (property == StringRef("path")) {
+            // Fall back to loading directly by path when there's no usable security-scoped
+            // bookmark (e.g. bookmark creation failed because this is an ad-hoc-signed /
+            // non-sandboxed local build). If a bookmark IS present, the "bookmark" property
+            // change above already (or will already) handle loading, so skip here to avoid
+            // loading the font twice.
+            MemoryBlock buffer;
+            var bookmark = treeWhosePropertyHasChanged.getProperty("bookmark", buffer);
+            bool hasBookmark{bookmark.isBinaryData() && bookmark.getBinaryData()->getSize() > 0};
+            if (!hasBookmark) {
+                String soundFontPath = treeWhosePropertyHasChanged.getProperty("path", "");
+                if (soundFontPath.isNotEmpty()) {
+                    unloadAndLoadFont(soundFontPath);
+                }
             }
         }
 #else
@@ -279,6 +315,7 @@ void FluidSynthModel::loadFont(const String &absPath) {
     if (!absPath.isEmpty()) {
         sfont_id = fluid_synth_sfload(synth.get(), absPath.toStdString().c_str(), 1);
         // if -1 is returned, that indicates failure
+        currentFontPath = absPath;
     }
     // refresh regardless of success, if only to clear the table
     refreshBanks();
@@ -328,6 +365,9 @@ void FluidSynthModel::refreshBanks() {
 }
 
 void FluidSynthModel::setSampleRate(float sampleRate) {
+    if (sampleRate == currentSampleRate) {
+        return;
+    }
     currentSampleRate = sampleRate;
     // https://stackoverflow.com/a/40856043/5257399
     // test if a smart pointer is null
@@ -335,7 +375,21 @@ void FluidSynthModel::setSampleRate(float sampleRate) {
         // don't worry; we'll do this in initialise phase regardless
         return;
     }
-    fluid_synth_set_sample_rate(synth.get(), sampleRate);
+    // fluidsynth >= 2.3 no longer supports changing the sample rate of a live synth, so we have to
+    // tear down and rebuild it, then restore whatever soundfont/state was previously active.
+    setUpSynth();
+    if (currentFontPath.isNotEmpty()) {
+        loadFont(currentFontPath);
+        reapplySynthState();
+    }
+}
+
+void FluidSynthModel::reapplySynthState() {
+    parameterChanged("bank", 0.0f);
+    parameterChanged("preset", 0.0f);
+    for (const auto &[param, controller]: paramToController) {
+        parameterChanged(param, 0.0f);
+    }
 }
 
 void FluidSynthModel::processBlock(AudioBuffer<float>& buffer, MidiBuffer& midiMessages) {
@@ -425,13 +479,17 @@ void FluidSynthModel::processBlock(AudioBuffer<float>& buffer, MidiBuffer& midiM
     // fluid_synth_get_cc(fluidSynth, 0, 73, &pval);
     // Logger::outputDebugString ( juce::String::formatted("hey: %d\n", pval) );
 
+    // fluid_synth_process() wants float* out[], but getArrayOfWritePointers() gives float* const out[]
+    vector<float*> outChannels{
+        buffer.getArrayOfWritePointers(),
+        buffer.getArrayOfWritePointers() + buffer.getNumChannels()};
     fluid_synth_process(
         synth.get(),
         buffer.getNumSamples(),
         0,
         nullptr,
         buffer.getNumChannels(),
-        buffer.getArrayOfWritePointers());
+        outChannels.data());
 }
 
 int FluidSynthModel::getNumPrograms()

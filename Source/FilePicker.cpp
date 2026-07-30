@@ -10,10 +10,10 @@
 //   #include <CoreFoundation/CFURL.h>
 // #endif
 #if JUCE_MAC || JUCE_IOS
-  #include <juce_core/native/juce_mac_CFHelpers.h>
   #include <CoreFoundation/CFString.h>
   #include <CoreFoundation/CFData.h>
   #include <CoreFoundation/CFError.h>
+  #include <juce_core/native/juce_CFHelpers_mac.h>
   using juce::CFUniquePtr;
 #endif
 
@@ -74,16 +74,29 @@ void FilePicker::filenameComponentChanged (FilenameComponent*) {
 #if JUCE_MAC || JUCE_IOS
     CFUniquePtr<CFStringRef> fileExtensionCF{fileChooser.getCurrentFile().getFullPathName().toCFString()};
     CFUniquePtr<CFURLRef> cfURL{CFURLCreateWithFileSystemPath(NULL, fileExtensionCF.get(), CFURLPathStyle::kCFURLPOSIXPathStyle, false)};
-    CFErrorRef* cfError;
+    CFErrorRef cfErrorRaw{nullptr};
 
     // CFURLCreateBookmarkData causes this error:
     // cannot open file at line 45340 of [d24547a13b]
     // os_unix.c:45340: (0) open(/var/db/DetachedSignatures) - Undefined error: 0
-    CFUniquePtr<CFDataRef> cfData{CFURLCreateBookmarkData(NULL, cfURL.get(), bookmarkCreationOptions, NULL, NULL, cfError)};
+    CFUniquePtr<CFDataRef> cfData{CFURLCreateBookmarkData(NULL, cfURL.get(), bookmarkCreationOptions, NULL, NULL, &cfErrorRaw)};
+    CFUniquePtr<CFErrorRef> cfError{cfErrorRaw};
 
-    const UInt8 * cfDataBytePtr{CFDataGetBytePtr(cfData.get())};
-    CFIndex cfDataByteLength{CFDataGetLength(cfData.get())};
-    {
+    if (cfData == nullptr) {
+        // Security-scoped bookmark creation can fail outright for an ad-hoc-signed / non-sandboxed
+        // build (e.g. a local dev build without a real Developer ID), since it involves a
+        // code-signature lookup on the calling app. When that happens, leave "bookmark" untouched
+        // and fall through to set "path" below, so FluidSynthModel can fall back to loading the
+        // font directly by path instead of via the (unusable) bookmark.
+#if JUCE_DEBUG
+        if (cfError != nullptr) {
+            CFUniquePtr<CFStringRef> cfErrorDescription{CFErrorCopyDescription(cfError.get())};
+            Logger::outputDebugString("Failed to create security-scoped bookmark: " + String::fromCFString(cfErrorDescription.get()));
+        }
+#endif
+    } else {
+        const UInt8 * cfDataBytePtr{CFDataGetBytePtr(cfData.get())};
+        CFIndex cfDataByteLength{CFDataGetLength(cfData.get())};
         Value value{valueTreeState.state.getChildWithName("soundFont").getPropertyAsValue("bookmark", nullptr)};
         var var{static_cast<const void*>(cfDataBytePtr), static_cast<size_t>(cfDataByteLength)};
         value.setValue(var);

@@ -76,9 +76,17 @@ private:
 
     void unloadAndLoadFont(const String &absPath);
     void loadFont(const String &absPath);
-    
+
+    // (re)creates the synth against the currently configured settings (incl. sample rate) and
+    // (re)registers the modulators. Callable both from initialise() and from setSampleRate(),
+    // since fluidsynth >= 2.3 no longer supports changing the sample rate of a live synth.
+    void setUpSynth();
+    // reapplies the currently-selected bank/preset and controller values to the (freshly recreated) synth
+    void reapplySynthState();
+
     int sfont_id;
     unsigned int channel;
+    String currentFontPath;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FluidSynthModel)
 };
